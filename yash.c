@@ -11,8 +11,10 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
+// Tasnia
+
 // LIMITS
-#define MAX_ARGS 100
+#define MAX_ARGS 128
 
 // IDENTIFIERS
 #define INPUT_REDIRECT "<"
@@ -28,19 +30,15 @@
 #define FG_JOB_NUM -1
 
 // CUSTOM ERRORS - make them negative numbers
-#define SUCCESS 42
-#define INPUT_PARSING_ERROR -101
-#define COMMAND_PROCESSING_ERROR -102
-#define FILE_REDIRECTION_ERROR -103
+#define SUCCESS 1
+#define ERROR -1
+#define INPUT_PARSING_ERROR -1
+#define COMMAND_PROCESSING_ERROR -1
+#define FILE_REDIRECTION_ERROR -1
 
 // MISC
-#define REDIRECTION_REQUIRED 1400 // change this later
 #define TERMINAL_PROMPT "# "
-#define COMMAND_DELIMETER " "
-#define PLUS "+"
-#define MINUS "-"
-#define TRUE 1
-#define FALSE 0
+#define COMMAND_DELIMETER " \t"
 
 // ENUMS
 enum job_status
@@ -65,7 +63,7 @@ typedef struct process_group
     char *command;
     int job_number;
     int background;
-    int display_update;
+    int display_update; // TODO: Check - I may not need this?
     enum job_status status;
     process_t *first_process;
     process_t *second_process;
@@ -516,7 +514,7 @@ int execute_pipe_process(job_t *job)
         close(pipe_fd[1]);
 
         // wait for each process to be done, not stopped!
-        waitpid(pid1, NULL, 0);
+        // waitpid(pid1, NULL, 0);
         waitpid(pid2, NULL, 0);
         // terminate the process naturally to inform shell of completion
         exit(EXIT_SUCCESS);
@@ -534,7 +532,6 @@ void execute_in_foreground(job_t *job)
     {
         pid = waitpid(-1, &status, WUNTRACED);
     } while (update_job_status(status, pid) && (job->status == RUNNING));
-    // printf("We have now left the foreground loop\n");
     // print_job_table(1, 1, 1);
     tcsetpgrp(STDIN_FILENO, shell_pid);
 }
@@ -547,7 +544,7 @@ void continue_background_job(job_t *job, int fg)
     if (kill_signal_sent_status < 0)
     {
         job->status = STOPPED;
-        printf("Error when sending kill (SIGCONT) signal! Error No: [%d]\n", errno);
+        // printf("Error when sending kill (SIGCONT) signal! Error No: [%d]\n", errno);
         return;
     }
     if (fg)
@@ -631,8 +628,7 @@ int update_job_status(int status, pid_t pid)
     // there's one error you may have to account for here, specifically pipes (what exactly is a child process?)
     // what if a process related to a pipe is stopped or finished but you confuse it for the entire process?
     // solution now, when we setpgid to pid for both processes - we know if will be put into the list!
-
-    // printf("Updating Status for pid/pgid:[%d]\n", pid);
+    // [UPDATE] - no, waitpid only waits for direct children :)
 
     // for unblocking waitpid calls, -1 may be input if there are no processes to update
     if (pid <= 0)
@@ -668,7 +664,6 @@ int update_job_status(int status, pid_t pid)
     }
     else
     {
-        // printf("DONE\n");
         // then this process group with pgid terminated ab-or normally, so just mark it as done
         // if it was terminated via SIGINT, it will not display done because the job was moved to the fg earlier!
         job->display_update = 1;
@@ -695,7 +690,7 @@ void update_job_command_str(job_t *job, int apply_bg)
     {
         if (job->command[len - 1] == '&' && job->command[len - 2] == ' ')
         {
-            // suffix already include, no update required
+            // suffix already included, no update required
             return;
         }
         char bg_suffix[2] = " &";
@@ -893,7 +888,7 @@ void execute_bg()
 {
     // job statuses may have finished executing in the time of commandline processing to executing this command
     update_job_table_statuses();
-    job_t *bg_job = find_next_job_to_fg();
+    job_t *bg_job = find_next_job_to_bg();
     if (bg_job == NULL)
     {
         // there are no stopped background jobs, so just end execution
