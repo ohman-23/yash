@@ -80,31 +80,36 @@ int process_input(int tokenized_command_length, char *tokenized_command[], job_t
 void execute_job(job_t *job);
 int execute_process(job_t *job);
 int execute_pipe_process(job_t *job);
-void execute_in_background(job_t *job);
-void continue_background_job(job_t *job); // make sure to turn off notifications for this job when it finishes in foreground!
+void continue_background_job(job_t *job, int fg);
 void execute_in_foreground(job_t *job);
 void print_bg_job_updates();
 void nuke_all_file_descriptors();
+int execute_custom_commands();
 
 // JOB LL
 job_t *job_list_head;
 job_t *recent_stopped_job;
 
 // JOB DATA STRUCTURE FUNCTIONS
+void update_job_command(job_t *job, int fg);
 void print_job_table();
 void print_job(job_t *job, int is_most_recent_job);
 job_t *find_job(pid_t pgid);
 int find_most_recent_job_num();
-int remove_job(job_t *job);
+int remove_job(pid_t pgid, int free);
 void add_job(job_t *job);
-void free_job_table(job_t *job);
+void free_job_table();
 void free_job(job_t *job);
 void free_process(process_t *process);
 int apply_file_redirects(process_t *process); // if there is an error here, we immediately EXIT the process [to be collected with status later]
-int is_job_done(job_t *job);
-int is_job_stopped(job_t *job);
-int update_job_table(job_t *job); // make sure just to remove any processes in the job that are registered as fg, this is fine as true fg processes will hang and not ask for another prompt until complete!
+void update_job_table_statuses();             // make sure just to remove any processes in the job that are registered as fg, this is fine as true fg processes will hang and not ask for another prompt until complete!
 int update_job_status(int status, pid_t pid);
+
+// CUSTOM COMMAND FUNCTIONS
+int execute_custom_commands();
+void execute_bg();
+void execute_fg();
+void execute_jobs();
 
 // DEBUG FUNCTIONS
 void print_parsed_command_debug(char *buffer[]);
@@ -121,7 +126,7 @@ int main(int argc, char const *argv)
     */
     signal(SIGINT, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
-    signal(SIGTTOU, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN); // only allow pg in control of the fg to write to terminal
 
     shell_pid = getpid();
 
@@ -141,7 +146,8 @@ int main(int argc, char const *argv)
 
     while (1)
     {
-        // running updates for status updates on processes
+        // running updates for status updates on processes (since we are using a different pattern)
+        update_job_table_statuses();
 
         // get input from the user
         char *command = readline(TERMINAL_PROMPT);
@@ -149,9 +155,9 @@ int main(int argc, char const *argv)
         // this is how we exit the command line with Ctrl-D (it sends an EOF to the readline command)
         if (command == NULL)
         {
-            // TODO: clean out entire job list
             free(command);
-            exit(INPUT_PARSING_ERROR);
+            free_job_table();
+            exit(EXIT_SUCCESS);
         }
         char *command_copy = strdup(command);
         char *tokenized_command[MAX_ARGS];
@@ -165,7 +171,14 @@ int main(int argc, char const *argv)
             continue;
         }
 
-        // TODO: check for custom commands first FUNCTION
+        // check for the execution of custom commands
+        if (execute_custom_commands(command))
+        {
+            free(command);
+            free(command_copy);
+            print_bg_job_updates();
+            continue;
+        }
 
         job_t *job = (job_t *)malloc(sizeof(job_t));
         memset(job, 0, sizeof(job_t));
@@ -181,13 +194,7 @@ int main(int argc, char const *argv)
             continue;
         }
         execute_job(job);
-
-        // launch jobs
-
-        // process that and place that into a command buffer
-        // process the command buffer into seperate processes with error handling (automatically before launching processes)
-        // start a command for non pipe and pipe (make sure to set process groups in both)
-        // print out done and stopped jobs
+        print_bg_job_updates();
     }
 
     return 0;
@@ -312,12 +319,6 @@ int process_input(int tokenized_command_length, char *tokenized_command[], job_t
     return SUCCESS;
 }
 
-void clean_terminal(char *command, char *command_copy)
-{
-    free(command);
-    free(command_copy);
-}
-
 // ==== PROCESS LAUNCHING ==== //
 void execute_job(job_t *job)
 {
@@ -335,13 +336,15 @@ void execute_job(job_t *job)
     // update controlling job
     job->pgid = pgid;
     job->status = RUNNING;
+    job->display_update = 0;
     if (job->background)
     {
         job->job_number = find_most_recent_job_num() + 1;
     }
     else
     {
-        job->job_number = 1000;
+        // we will use the id -1 to signify that this job is one in the foreground
+        job->job_number = -1;
     }
 
     add_job(job);
@@ -350,15 +353,15 @@ void execute_job(job_t *job)
     // print_job_table();
 
     // delegate job to being registered in the foreground or background
-    if (job->background)
-    {
-        execute_in_background(job);
-    }
-    else
+    if (!job->background)
     {
         execute_in_foreground(job);
     }
-    // makes sense to register job during the background or foreground portion because then a valid job is created
+    else
+    {
+        // execute job in background, so we wish to be updated if it completes!
+        job->display_update = 1;
+    }
 }
 
 int execute_process(job_t *job)
@@ -380,7 +383,8 @@ int execute_process(job_t *job)
         // check if you need to launch in the foreground or the background (need to set tcgrep thing)
         if (!job->background)
         {
-            tcsetpgrp(STDIN_FILENO, job->pgid);
+            // have to set as pid since pid==pgid, and job->pgid may not be set yet due to race conditions
+            tcsetpgrp(STDIN_FILENO, pid);
         }
 
         int redirects_status = apply_file_redirects(job->first_process);
@@ -399,21 +403,120 @@ int execute_process(job_t *job)
                 exit(EXIT_FAILURE);
             }
         }
+        exit(EXIT_FAILURE);
     }
     return pid;
 }
 
 int execute_pipe_process(job_t *job)
 {
-    printf("[execute_pipe_process] - Not Implemented Yet!\n");
-    return 0;
+    int pgid = fork();
+    if (pgid < 0)
+    {
+        exit(EXIT_FAILURE);
+    }
+    if (pgid == 0)
+    {
+        // signal stuff to be inherited by children
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        // we want children processes to be able to write to the terminal if the pg is in the foreground
+        signal(SIGTTOU, SIG_DFL);
+
+        setpgid(0, 0);
+
+        // setting process to be either in foreground or background
+        if (!job->background)
+        {
+            // have to set as pid since pid==pgid, and job->pgid may not be set yet due to race conditions
+            tcsetpgrp(STDIN_FILENO, pgid);
+        }
+
+        // create fd for pipe
+        int pipe_fd[2];
+        int pipe_creation_status = pipe(pipe_fd);
+        if (pipe_creation_status < 0)
+        {
+            exit(EXIT_FAILURE);
+        }
+        // first process
+        int pid1 = fork();
+        if (pid1 < 0)
+        {
+            exit(EXIT_FAILURE);
+        }
+        if (pid1 == 0)
+        {
+            // assign this child process to pg of parent process!
+            setpgid(0, pgid);
+            // apply file redirects
+            int redirects_status = apply_file_redirects(job->first_process);
+            if (redirects_status < 0)
+            {
+                printf("File Redirection Error: %d\n", redirects_status);
+                exit(redirects_status);
+            }
+            // apply pipe stdout redirection
+            close(pipe_fd[0]);
+            dup2(pipe_fd[1], STDOUT_FILENO);
+            close(pipe_fd[1]);
+            // means we're good to execvp
+            process_t *process = job->first_process;
+            if (execvp(process->argv[0], process->argv) < 0)
+            {
+                if (process->redirect_error_filename != NULL)
+                {
+                    perror(job->command);
+                    exit(EXIT_FAILURE);
+                }
+            }
+            exit(EXIT_FAILURE);
+        }
+        // second process
+        int pid2 = fork();
+        if (pid2 < 0)
+        {
+            exit(EXIT_FAILURE);
+        }
+        if (pid2 == 0)
+        {
+            // assign this child process to pg of parent process!
+            setpgid(0, pgid);
+            // apply file redirects
+            int redirects_status = apply_file_redirects(job->second_process);
+            if (redirects_status < 0)
+            {
+                printf("File Redirection Error: %d\n", redirects_status);
+                exit(redirects_status);
+            }
+            // apply pipe stdin redirection
+            close(pipe_fd[1]);
+            dup2(pipe_fd[0], STDIN_FILENO);
+            close(pipe_fd[0]);
+            // means we're good to execvp
+            process_t *process = job->second_process;
+            if (execvp(process->argv[0], process->argv) < 0)
+            {
+                if (process->redirect_error_filename != NULL)
+                {
+                    perror(job->command);
+                    exit(EXIT_FAILURE);
+                }
+            }
+            exit(EXIT_FAILURE);
+        }
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+
+        // wait for each process to be done, not stopped!
+        waitpid(pid1, NULL, 0);
+        waitpid(pid2, NULL, 0);
+        // terminate the process naturally to inform shell of completion
+        exit(EXIT_SUCCESS);
+    }
+    return pgid;
 }
 
-void execute_in_background(job_t *job)
-{
-    printf("[execute_in_background] - Not Implemented Yet!\n");
-    return;
-}
 void execute_in_foreground(job_t *job)
 {
     int status;
@@ -422,13 +525,36 @@ void execute_in_foreground(job_t *job)
     tcsetpgrp(STDIN_FILENO, job->pgid);
     do
     {
-        print_job_table();
         pid = waitpid(-1, &status, WUNTRACED);
-    } while (update_job_status(status, pid) && !is_job_stopped(job));
-    printf("We have now left the foreground loop\n");
+    } while (update_job_status(status, pid) && (job->status == RUNNING));
+    // printf("We have now left the foreground loop\n");
+    print_job_table();
     tcsetpgrp(STDIN_FILENO, shell_pid);
 }
 
+void continue_background_job(job_t *job, int fg)
+{
+    // make sure to turn off notifications for this job when it finishes in foreground!
+    // by default foreground jobs will not start off with the notification flag
+    int kill_signal_sent_status = kill(-job->job_number, SIGCONT);
+    if (kill_signal_sent_status < 0)
+    {
+        printf("Error when sending kill (SIGCONT) signal!\n");
+        return;
+    }
+    job->status = RUNNING;
+    if (fg)
+    {
+        job->display_update = 0;
+        execute_in_foreground(job);
+    }
+    else
+    {
+        job->display_update = 1;
+    }
+}
+
+// TODO: Check with TA about file redirections
 int apply_file_redirects(process_t *process)
 {
     // create and use dup while checking each of the file redirections
@@ -446,7 +572,7 @@ int apply_file_redirects(process_t *process)
     }
     if (process->redirect_output_filename != NULL)
     {
-        int fd = open(process->redirect_output_filename, O_CREAT | O_WRONLY | O_TRUNC, S_IRWXU);
+        int fd = open(process->redirect_output_filename, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
         if (fd < 0)
         {
             nuke_all_file_descriptors();
@@ -457,7 +583,7 @@ int apply_file_redirects(process_t *process)
     }
     if (process->redirect_error_filename != NULL)
     {
-        int fd = open(process->redirect_error_filename, O_CREAT | O_WRONLY | O_TRUNC, S_IRWXU);
+        int fd = open(process->redirect_error_filename, O_CREAT | O_WRONLY | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
         if (fd < 0)
         {
             nuke_all_file_descriptors();
@@ -489,55 +615,93 @@ int update_job_status(int status, pid_t pid)
 {
     // there's one error you may have to account for here, specifically pipes (what exactly is a child process?)
     // what if a process related to a pipe is stopped or finished but you confuse it for the entire process?
-    pid_t pgid = getpgid(pid);
-    printf("Updating Status for [%d]", pid);
-    if (pgid != pid)
-    {
-        // my fix to the above issue for now ...
-        return 1;
-    }
+    // solution now, when we setpgid to pid for both processes - we know if will be put into the list!
+
+    printf("Updating Status for pid/pgid:[%d]\n", pid);
+
     // for unblocking waitpid calls, -1 may be input if there are no processes to update
-    if (pid < 0)
+    if (pid <= 0)
     {
+        // pid < 0 means an error, and pid == 0 means WNOHANG was provided and child process is not terminated yet
         return 0;
     }
-    job_t *job = find_job(pgid);
+    job_t *job = find_job(pid);
     if (job == NULL)
     {
         // job NOT found
         return 1;
     }
-
     if (WIFSTOPPED(status))
     {
-        printf("STOPPED! STOPPED_SIG: %d, SIGSTOP: %d\n", WSTOPSIG(status), SIGSTOP);
-        if (WSTOPSIG(status) == SIGSTOP)
-        {
-            printf("SIGSTOP\n");
-        }
-    }
-    else
-    {
-        printf("DONE\n");
-    }
-    if (WIFSTOPPED(status))
-    {
-        printf("In process STOPPED!\n");
         // then this process group with pgid was STOPPED
+        printf("STOPPED\n");
         job->status = STOPPED;
         recent_stopped_job = job;
         if (WSTOPSIG(status) == SIGTSTP || WSTOPSIG(status) == SIGSTOP)
         {
             job->display_update = 0;
+            if (job->job_number == -1)
+            {
+                // this means we are transitioning a foreground job in to the background
+                // because of foreground jobs blocking stdin, we can be assured there will only ever be one at a given time
+                remove_job(pid, 0);
+                job->job_number = job->job_number = find_most_recent_job_num() + 1;
+                add_job(job);
+            }
         }
     }
     else
     {
-        printf("In process DONE\n");
+        printf("DONE\n");
         // then this process group with pgid terminated ab-or normally, so just mark it as done
         job->status = DONE;
     }
     return 1;
+}
+
+void update_job_table_statuses()
+{
+    int status;
+    pid_t pid;
+    // poll all child processes of the shell to see if any new processes have finished!
+    do
+    {
+        pid = waitpid(-1, &status, WNOHANG | WUNTRACED);
+    } while (update_job_status(status, pid));
+    // printf("We have now left the foreground loop\n");
+    print_job_table();
+}
+
+void update_job_command(job_t *job, int fg_to_bg)
+{
+    int len = strlen(job->command);
+    if (fg_to_bg)
+    {
+        if (job->command[len - 1] == '&' && job->command[len - 2] == ' ')
+        {
+            // suffix already include, no update required
+            return;
+        }
+        char bg_suffix[2] = " &";
+        char *updated_command = (char *)malloc((len + 3) * sizeof(char));
+        memset(updated_command, '\0', (len + 3) * sizeof(char));
+        strcpy(updated_command, job->command);
+        strcpy(updated_command, bg_suffix);
+        free(job->command);
+        job->command = updated_command;
+    }
+    else
+    {
+        // we're updating a string from the bg to the fg
+        if (!(job->command[len - 1] == '&' && job->command[len - 2] == ' '))
+        {
+            // suffix not present, no need for removal
+            return;
+        }
+        // remove the background job suffix via null termination!
+        job->command[len - 1] = '\0';
+        job->command[len - 2] = '\0';
+    }
 }
 
 // ==== JOB DATA STRUCTURE FUNCTIONS ==== //
@@ -558,7 +722,44 @@ void add_job(job_t *job)
             curr->next = job;
             return;
         }
+        curr = curr->next;
     }
+}
+
+int remove_job(pid_t pgid, int free)
+{
+    // because of fg and bg (moving fg to a bg process), we may not want to completely free a job!
+    job_t *curr = job_list_head;
+    job_t *prev = NULL;
+    if (curr == NULL)
+    {
+        return 0;
+    }
+    while (curr != NULL)
+    {
+        if (curr->pgid == pgid)
+        {
+            if (prev == NULL)
+            {
+                // remove head of job list / only one item in the LL
+                job_list_head = curr->next;
+                if (free)
+                {
+                    free_job(curr);
+                }
+                return 1;
+            }
+            prev->next = curr->next;
+            if (free)
+            {
+                free_job(curr);
+            }
+            return 1;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    return 0;
 }
 
 job_t *find_job(pid_t pgid)
@@ -594,8 +795,7 @@ void print_job_table()
     job_t *curr = job_list_head;
     while (curr != NULL)
     {
-        // TODO: CHANGE BACK TO curr->background
-        if (1)
+        if (curr->background)
         {
             int is_most_recent_job = (most_recent_job_num == curr->job_number) ? 1 : 0;
             print_job(curr, is_most_recent_job);
@@ -604,10 +804,46 @@ void print_job_table()
     }
 }
 
+// ==== CUSTOM COMMAND FUNCTIONS ==== //
+int execute_custom_commands(char *command)
+{
+    if (strcmp(command, FOREGROUND) == 0)
+    {
+        execute_fg();
+        return 1;
+    }
+    else if (strcmp(command, BACKGROUND) == 0)
+    {
+        execute_bg();
+        return 1;
+    }
+    else if (strcmp(command, JOBS) == 0)
+    {
+        execute_jobs();
+        return 1;
+    }
+    return 0;
+}
+
+void execute_bg()
+{
+    printf("[execute_bg] - Not Implemented Yet!\n");
+}
+void execute_fg()
+{
+    printf("[execute_fg] - Not Implemented Yet!\n");
+}
+void execute_jobs()
+{
+    printf("[execute_jobs] - Not Implemented Yet!\n");
+}
+
+// ==== DEBUGGING FUNCTIONS ==== //
+
 void print_job(job_t *job, int is_most_recent_job)
 {
     char status[20] = "Unknown";
-    memset(status, '\0', sizeof(status));
+    memset(status, '\0', sizeof(char) * 20);
     switch (job->status)
     {
     case (RUNNING):
@@ -644,29 +880,26 @@ int find_most_recent_job_num()
     while (curr != NULL)
     {
         // ensures that foreground jobs are not counted towards "recent jobs"
-        // TODO: ADD curr->background && after FOREGROUND WORKING
-        recent_job_num = (curr->job_number > recent_job_num) ? curr->job_number : recent_job_num;
+        recent_job_num = (curr->job_number > recent_job_num && curr->background) ? curr->job_number : recent_job_num;
         curr = curr->next;
     }
     return recent_job_num;
 }
 
-int is_job_stopped(job_t *job)
+void free_job_table()
 {
-    if (job->status == STOPPED)
+    job_t *curr = job_list_head;
+    job_t *next;
+    if (curr == NULL)
     {
-        return 1;
+        return;
     }
-    return 0;
-}
-
-int is_job_done(job_t *job)
-{
-    if (job->status == DONE)
+    while (curr != NULL)
     {
-        return 1;
+        next = curr->next;
+        free_job(curr);
+        curr = next;
     }
-    return 0;
 }
 
 void free_job(job_t *job)
