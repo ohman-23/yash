@@ -53,7 +53,6 @@ enum job_status
 // STRUCTS
 typedef struct process
 {
-    pid_t pid;
     char *argv[MAX_ARGS + 1];
     char *redirect_input_filename;
     char *redirect_output_filename;
@@ -91,7 +90,7 @@ job_t *recent_stopped_job;
 // JOB DATA STRUCTURE FUNCTIONS
 void update_job_command_str(job_t *job, int fg);
 void print_job_table(int print_running_jobs, int print_stopped_jobs, int print_done_jobs);
-void print_job(job_t *job, int is_most_recent_job);
+void print_job(job_t *job, int is_most_recent_job, int custom_command);
 job_t *find_job(pid_t pgid);
 job_t *find_next_job_to_bg();
 job_t *find_next_job_to_fg();
@@ -203,6 +202,8 @@ int main(int argc, char const *argv)
         }
         execute_job(job);
 
+        // why the hell not?
+        update_job_table_statuses();
         print_job_table(0, 0, 1);
         remove_done_jobs();
     }
@@ -542,13 +543,13 @@ void continue_background_job(job_t *job, int fg)
 {
     // make sure to turn off notifications for this job when it finishes in foreground!
     // by default foreground jobs will not start off with the notification flag
-    int kill_signal_sent_status = kill(-job->job_number, SIGCONT);
+    int kill_signal_sent_status = kill(-job->pgid, SIGCONT);
     if (kill_signal_sent_status < 0)
     {
-        printf("Error when sending kill (SIGCONT) signal!\n");
+        job->status = STOPPED;
+        printf("Error when sending kill (SIGCONT) signal! Error No: [%d]\n", errno);
         return;
     }
-    job->status = RUNNING;
     if (fg)
     {
         job->display_update = 0;
@@ -631,7 +632,7 @@ int update_job_status(int status, pid_t pid)
     // what if a process related to a pipe is stopped or finished but you confuse it for the entire process?
     // solution now, when we setpgid to pid for both processes - we know if will be put into the list!
 
-    printf("Updating Status for pid/pgid:[%d]\n", pid);
+    // printf("Updating Status for pid/pgid:[%d]\n", pid);
 
     // for unblocking waitpid calls, -1 may be input if there are no processes to update
     if (pid <= 0)
@@ -648,7 +649,7 @@ int update_job_status(int status, pid_t pid)
     if (WIFSTOPPED(status))
     {
         // then this process group with pgid was STOPPED
-        printf("STOPPED\n");
+        // printf("STOPPED\n");
         job->status = STOPPED;
         recent_stopped_job = job;
         if (WSTOPSIG(status) == SIGTSTP || WSTOPSIG(status) == SIGSTOP)
@@ -667,8 +668,9 @@ int update_job_status(int status, pid_t pid)
     }
     else
     {
-        printf("DONE\n");
+        // printf("DONE\n");
         // then this process group with pgid terminated ab-or normally, so just mark it as done
+        // if it was terminated via SIGINT, it will not display done because the job was moved to the fg earlier!
         job->display_update = 1;
         job->status = DONE;
     }
@@ -850,15 +852,15 @@ void print_job_table(int print_running_jobs, int print_stopped_jobs, int print_d
         is_most_recent_job = (most_recent_job_num == curr->job_number) ? 1 : 0;
         if (job_status == RUNNING && print_running_jobs == 1 && curr->background)
         {
-            print_job(curr, is_most_recent_job);
+            print_job(curr, is_most_recent_job, 0);
         }
         else if (job_status == STOPPED && print_stopped_jobs == 1 && curr->background)
         {
-            print_job(curr, is_most_recent_job);
+            print_job(curr, is_most_recent_job, 0);
         }
         else if (job_status == DONE && print_done_jobs == 1 && curr->background)
         {
-            print_job(curr, is_most_recent_job);
+            print_job(curr, is_most_recent_job, 0);
             // mark that the job notified the shell it is done!
             curr->display_update = 0;
         }
@@ -901,7 +903,8 @@ void execute_bg()
     update_job_command_str(bg_job, 1);
     int most_recent_job_num = find_most_recent_job_num();
     int is_most_recent_job = (most_recent_job_num == bg_job->job_number) ? 1 : 0;
-    print_job(bg_job, is_most_recent_job);
+    bg_job->status = RUNNING;
+    print_job(bg_job, is_most_recent_job, 1);
     // send SIGCONT to bg_job pg, and wait for it in the background
     continue_background_job(bg_job, 0);
 }
@@ -941,7 +944,8 @@ void execute_fg()
     update_job_command_str(fg_job, 0);
     int most_recent_job_num = find_most_recent_job_num();
     int is_most_recent_job = (most_recent_job_num == fg_job->job_number) ? 1 : 0;
-    print_job(fg_job, is_most_recent_job);
+    fg_job->status = RUNNING;
+    print_job(fg_job, is_most_recent_job, 1);
     // make sure the job in the job list is no longer a background job
     // do this after finding the most recent job to account for the fact that it might be latest stopped job
     fg_job->background = 0;
@@ -990,7 +994,7 @@ void execute_jobs()
 
 // ==== DEBUGGING FUNCTIONS ==== //
 
-void print_job(job_t *job, int is_most_recent_job)
+void print_job(job_t *job, int is_most_recent_job, int custom_command)
 {
     char status[20] = "Unknown";
     memset(status, '\0', sizeof(char) * 20);
@@ -1009,12 +1013,24 @@ void print_job(job_t *job, int is_most_recent_job)
         break;
     }
 
-    if (is_most_recent_job)
+    if (is_most_recent_job && custom_command)
     {
+        // printing job in the "jobs" format for the most recent job created
+        printf("[%d]+\t%s\n", job->job_number, job->command);
+    }
+    else if (!is_most_recent_job && custom_command)
+    {
+        // printing job in the "jobs" format for previous jobs
+        printf("[%d]+\t%s\n", job->job_number, job->command);
+    }
+    else if (is_most_recent_job && !custom_command)
+    {
+        // printing job in the "job table" format for the most recent job created
         printf("[%d]+\t%s\t\t\t%s\n", job->job_number, status, job->command);
     }
-    else
+    else if (!is_most_recent_job && !custom_command)
     {
+        // printing job in the "job table" format for previous jobs
         printf("[%d]-\t%s\t\t\t%s\n", job->job_number, status, job->command);
     }
 }
@@ -1124,7 +1140,6 @@ void print_job_debug(job_t *job)
 
 void print_process_debug(process_t *process)
 {
-    printf("pid: %d\n", process->pid);
     print_parsed_command_debug(process->argv);
     printf("input file: %s\n", process->redirect_input_filename);
     printf("output file: %s\n", process->redirect_output_filename);
